@@ -11,7 +11,26 @@ import copy
 import datetime
 import random
 
-from networks import resnet20, resnet32, resnet18, mobilenetv2
+from data_mimic import MimicFullDataset, my_collate_fn, my_collate_fn_led, DataCollatorForMimic, modify_rule
+from torch.nn.parallel import DistributedDataParallel
+
+import transformers
+from transformers import (
+    AutoConfig,
+    AutoModelForSequenceClassification,
+    AutoModelForMaskedLM,
+    AutoTokenizer,
+    DataCollatorWithPadding,
+    EvalPrediction,
+    HfArgumentParser,
+    PretrainedConfig,
+    Trainer,
+    TrainingArguments,
+    default_data_collator,
+    set_seed,
+)
+
+from networks import LongformerForMaskedLM 
 from utils import *
 from dataset_utils import partition_data, get_dataloader
 
@@ -21,14 +40,14 @@ def get_args():
     parser = argparse.ArgumentParser()
 
     # federated setup parameters
-    parser.add_argument('--model', type=str, default='mobilenetv2',
+    parser.add_argument('--model', type=str, default='LongformerForMaskedLM',
                         help='neural network used in training')
-    parser.add_argument('--dataset', type=str, default='cifar10',
+    parser.add_argument('--dataset', type=str, default='MIMIC3',
                         help='dataset used for training')
     parser.add_argument('--partition', type=str, default='homo',
                         help='the data partitioning strategy')
-    parser.add_argument('--alpha', type=float, default=0.5,
-                        help='concentration parameter for the dirichlet distribution for data partitioning')
+    # parser.add_argument('--alpha', type=float, default=0.5,
+    #                     help='concentration parameter for the dirichlet distribution for data partitioning')
     parser.add_argument('--n_parties', type=int, default=10,
                         help='number of workers in a distributed cluster')
     parser.add_argument('--sample_fraction', type=float, default=1.0,
@@ -75,6 +94,109 @@ def get_args():
     return args, appr_args
 
 
+@dataclass
+class DataTrainingArguments:
+    """
+    Arguments pertaining to what data we are going to input our model for training and eval.
+    Using `HfArgumentParser` we can turn this class
+    into argparse arguments to be able to specify them on
+    the command line.
+    """
+
+    max_seq_length: int = field(
+        default=128,
+        metadata={
+            "help": "The maximum total input sequence length after tokenization. Sequences longer "
+            "than this will be truncated, sequences shorter will be padded."
+        },
+    )
+    overwrite_cache: bool = field(
+        default=False, metadata={"help": "Overwrite the cached preprocessed datasets or not."}
+    )
+    pad_to_max_length: bool = field(
+        default=True,
+        metadata={
+            "help": "Whether to pad all samples to `max_seq_length`. "
+            "If False, will pad the samples dynamically when batching to the maximum length in the batch."
+        },
+    )
+    max_train_samples: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "For debugging purposes or quicker training, truncate the number of training examples to this "
+            "value if set."
+        },
+    )
+    max_eval_samples: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "For debugging purposes or quicker training, truncate the number of evaluation examples to this "
+            "value if set."
+        },
+    )
+    max_predict_samples: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "For debugging purposes or quicker training, truncate the number of prediction examples to this "
+            "value if set."
+        },
+    )
+    train_file: Optional[str] = field(
+        default=None, metadata={"help": "A csv or a json file containing the training data."}
+    )
+    validation_file: Optional[str] = field(
+        default=None, metadata={"help": "A csv or a json file containing the validation data."}
+    )
+    test_file: Optional[str] = field(default=None, metadata={"help": "A csv or a json file containing the test data."})
+    version: Optional[str] = field(
+        default=None, metadata={"help": "mimic version"}
+    )
+    global_attention_strides: Optional[int] = field(
+        default=3,
+        metadata={
+            "help": "how many gap between each (longformer) golabl attention token in prompt code descriptions, set to 1 for maximum accuracy, but requires more gpu memory."
+        },
+    )
+
+@dataclass
+class ModelArguments:
+    """
+    Arguments pertaining to which model/config/tokenizer we are going to fine-tune from.
+    """
+
+    model_name_or_path: str = field(
+        metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
+    )
+    config_name: Optional[str] = field(
+        default=None, metadata={"help": "Pretrained config name or path if not the same as model_name"}
+    )
+    tokenizer_name: Optional[str] = field(
+        default=None, metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
+    )
+    cache_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Where do you want to store the pretrained models downloaded from huggingface.co"},
+    )
+    use_fast_tokenizer: bool = field(
+        default=True,
+        metadata={"help": "Whether to use one of the fast tokenizer (backed by the tokenizers library) or not."},
+    )
+    model_revision: str = field(
+        default="main",
+        metadata={"help": "The specific model version to use (can be a branch name, tag name or commit id)."},
+    )
+    use_auth_token: bool = field(
+        default=False,
+        metadata={
+            "help": "Will use the token generated when running `transformers-cli login` (necessary to use this script "
+            "with private models)."
+        },
+    )
+    finetune_terms: str = field(
+        default="no",
+        metadata={"help": "what terms to train like bitfit (bias)."},
+    )
+
 def init_nets(n_parties, args):
     nets = {net_i: None for net_i in range(n_parties)}
     if args.dataset in {'mnist', 'cifar10', 'svhn'}:
@@ -101,10 +223,66 @@ def init_nets(n_parties, args):
 
     return nets
 
+def parse_args_kept():
+        parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
+    if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
+        # If we pass only one argument to the script and it's the path to a json file,
+        # let's parse it to get our arguments.
+        model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
+    else:
+        model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    training_args.broadcast_buffers = False
+        
+    # Setup logging
+    # if is_main_process(training_args.local_rank):
+    #     wandb.init(project="mimic_coder", entity="whaleloops")
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+    logger.setLevel(logging.INFO if training_args.should_log else logging.WARN)
+
+    # Log on each process the small summary:
+    logger.warning(
+        f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}"
+        + f"distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
+    )
+    # Set the verbosity to info of the Transformers logger (on main process only):
+    if training_args.should_log:
+        transformers.utils.logging.set_verbosity_info()
+        transformers.utils.logging.enable_default_handler()
+        transformers.utils.logging.enable_explicit_format()
+    logger.info(f"Training/evaluation parameters {training_args}")
+
+    return model_args, data_args, training_args
+
+def load_checkpoint_kept(training_args):
+    last_checkpoint = None
+    if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
+        last_checkpoint = get_last_checkpoint(training_args.output_dir)
+        if last_checkpoint is None and len(os.listdir(training_args.output_dir)) > 0:
+            raise ValueError(
+                f"Output directory ({training_args.output_dir}) already exists and is not empty. "
+                "Use --overwrite_output_dir to overcome."
+            )
+        elif last_checkpoint is not None and training_args.resume_from_checkpoint is None:
+            logger.info(
+                f"Checkpoint detected, resuming training at {last_checkpoint}. To avoid this behavior, change "
+                "the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
+            )
+
 
 if __name__ == '__main__':
     # ===== parsing arguments and initialize method =====
-    args, appr_args = get_args()
+    model_args, data_args, training_args = parse_args_kept()
+
+    last_checkpoint = load_checkpoint_kept(training_args)
+
+    
+
+
+
 
     if args.approach == 'fedavg':
         from approach.fedavg import FedAvg as Appr
