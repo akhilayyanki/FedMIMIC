@@ -9,8 +9,16 @@ import torch.nn as nn
 
 from datasets import CIFAR10_truncated, CIFAR100_truncated, ImageFolder_custom
 from data_aug_utils import AutoAugment
+from data_mimic import MimicFullDataset
 
 __all__ = ['partition_data', 'get_dataloader']
+
+def load_mimic3_data(data_args,tokenizer):
+    train_dataset = MimicFullDataset(data_args.version, "train", data_args.max_seq_length, tokenizer, 30, 4) # TODO delete 30 and 8
+    dev_dataset   = MimicFullDataset(data_args.version, "dev", data_args.max_seq_length, tokenizer, 30, 4)
+    eval_dataset  = MimicFullDataset(data_args.version, "test", data_args.max_seq_length, tokenizer, 30, 4)
+
+    return (train_dataset, dev_dataset, eval_dataset)
 
 def load_cifar10_data(datadir):
     transform = transforms.Compose([transforms.ToTensor()])
@@ -48,49 +56,18 @@ def load_tinyimagenet_data(datadir):
 
 
 def partition_data(dataset, datadir, partition, n_parties, alpha=0.4):
-    if dataset == 'cifar10':
-        X_train, y_train, X_test, y_test = load_cifar10_data(datadir)
-    elif dataset == 'cifar100':
-        X_train, y_train, X_test, y_test = load_cifar100_data(datadir)
-    elif dataset == 'tinyimagenet':
-        X_train, y_train, X_test, y_test = load_tinyimagenet_data(datadir)
+
+    if dataset == 'mimic3':
+        train_dataset, dev_dataset, eval_dataset = load_mimic3_data(data_args,tokenizer)
     else:
         raise NotImplementedError("dataset not imeplemented")
 
-    n_train = y_train.shape[0]
+    n_train = train_dataset.code_count 
 
     if partition == "homo" or partition == "iid":
         idxs = np.random.permutation(n_train)
         batch_idxs = np.array_split(idxs, n_parties)
         party2dataidx = {i: batch_idxs[i] for i in range(n_parties)}
-
-    elif partition == "noniid-labeldir" or partition == "noniid":
-        min_size = 0
-        min_require_size = 10
-        K = 10
-        if dataset == 'cifar100':
-            K = 100
-        elif dataset == 'tinyimagenet':
-            K = 200
-
-        N = y_train.shape[0]
-        party2dataidx = {}
-
-        while min_size < min_require_size:
-            idx_batch = [[] for _ in range(n_parties)]
-            for k in range(K):
-                idx_k = np.where(y_train == k)[0]
-                np.random.shuffle(idx_k)
-                proportions = np.random.dirichlet(np.repeat(alpha, n_parties))
-                proportions = np.array([p * (len(idx_j) < N / n_parties) for p, idx_j in zip(proportions, idx_batch)])
-                proportions = proportions / proportions.sum()
-                proportions = (np.cumsum(proportions) * len(idx_k)).astype(int)[:-1]
-                idx_batch = [idx_j + idx.tolist() for idx_j, idx in zip(idx_batch, np.split(idx_k, proportions))]
-                min_size = min([len(idx_j) for idx_j in idx_batch])
-
-        for j in range(n_parties):
-            np.random.shuffle(idx_batch[j])
-            party2dataidx[j] = idx_batch[j]
 
     return party2dataidx
 
