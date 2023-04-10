@@ -11,7 +11,7 @@ import copy
 import datetime
 import random
 
-from data_mimic import MimicFullDataset, my_collate_fn, my_collate_fn_led, DataCollatorForMimic, modify_rule
+from data_mimic import MimicFullDataset,Mimic3Dataset, my_collate_fn, my_collate_fn_led, DataCollatorForMimic, modify_rule
 from torch.nn.parallel import DistributedDataParallel
 
 import transformers
@@ -258,13 +258,6 @@ class ModelArguments:
         metadata={"help": "what terms to train like bitfit (bias)."},
     )
 
-def init_nets(n_parties):
-    nets = {net_i: None for net_i in range(n_parties)}
-
-    for net_i in range(n_parties):
-        nets[net_i] = get_model()
-
-    return nets
 
 def parse_args(args):
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments,FederatedSetupArguments))
@@ -339,15 +332,69 @@ def get_config(model_args,num_labels):
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
     )
+    
+def deactivate_relevant_gradients(model, trainable_components, verbose=True):
+    for param in model.parameters():
+        param.requires_grad = False
 
-def get_model(model_args,config):
-    return LongformerForMaskedLM.from_pretrained(
+    for name, param in model.named_parameters():
+        for component in trainable_components:
+            if component in name:
+                param.requires_grad = True
+                break
+    
+    if verbose:
+        print('\n\nTrainable Components:\n----------------------------------------\n')
+        total_trainable_params = 0 #sum(p.numel() for p in model.parameters() if p.requires_grad)
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                print(name, '  --->  ', param.shape)
+                total_trainable_params += param.shape[0] if len(param.shape) == 1 else param.shape[0] * param.shape[
+                    1]
+        print(f'\n----------------------------------------\nNumber of Trainable Parameters: {total_trainable_params}\n')
+    
+    return model
+
+def get_model_and_collator(model_args,config,global_window):
+    model= LongformerForMaskedLM.from_pretrained(
         model_args.model_name_or_path,
         from_tf=bool(".ckpt" in model_args.model_name_or_path),
         config=config,
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
+    )
+        # model.longformer.encoder.layer = model.longformer.encoder.layer[0:3] 
+    if model_args.finetune_terms != 'no':
+        trainable_components = model_args.finetune_terms.split(";")
+        model = deactivate_relevant_gradients(model, trainable_components, verbose=True)
+    if config.model_type == "longformer": 
+        global_attention_strides = data_args.global_attention_strides
+        data_collator = DataCollatorForMimic(global_attention_mask_size=global_window,global_attention_strides=global_attention_strides)
+    elif config.model_type == "led":
+        data_collator = my_collate_fn_led
+        model.use_cache=False
+        model.gradient_checkpointing=True 
+    else:
+        data_collator = default_data_collator
+        
+    return model,data_collator
+
+def compute_metrics(p: EvalPrediction):
+    preds = p.predictions[0] if isinstance(p.predictions, tuple) else p.predictions
+    y = p.label_ids==config.label_yes
+    result = all_metrics(y, preds, k=[5, 8, 15])
+    return result
+
+def get_trainer(model,args,train_dataset,eval_dataset,tokenizer,data_collator):
+    return Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset if training_args.do_train else None,
+        eval_dataset=eval_dataset if training_args.do_eval else None,
+        compute_metrics=compute_metrics,
+        tokenizer=tokenizer,
+        data_collator=data_collator,
     )
 
 
@@ -422,6 +469,13 @@ if __name__ == '__main__':
     logger = logging.getLogger()
     # logger.setLevel(logging.INFO)
     # ===================================================
+    
+    # ================ network related ================
+    # logger.info("Initializing nets")
+    # party2nets = init_nets(fed_args.n_parties, config)
+    # global_net = init_nets(1, fed_args)[0]
+    # # =================================================
+    
 
 
     # ================ dataset related ==================s
@@ -429,16 +483,22 @@ if __name__ == '__main__':
     seed_everything(fed_args.init_seed)
     # mapping from individual client to sample idx of the whole dataset
     party2dataidx = partition_data(
-        fed_args.dataset, fed_args.datadir, fed_args.partition, fed_args.n_parties, alpha=fed_args.alpha)
+        fed_args.dataset, fed_args.datadir, fed_args.partition, fed_args.n_parties, alpha=fed_args.alpha,n_train=len(train_dataset))
     # mapping from individual client to its local training data loader
-    party2loaders = {}
+    
+    party2nets={}
+    party2trainers = {}
     for party_id in range(fed_args.n_parties):
-        train_dl_local, _ = get_dataloader(fed_args, fed_args.dataset, fed_args.datadir,
-            fed_args.batch_size, fed_args.batch_size, party2dataidx[party_id])
-        party2loaders[party_id] = train_dl_local
+        train_ds_local = Mimic3Dataset(data_args.version, "train", data_args.max_seq_length, tokenizer, 30, 4,party2dataidx[party_id])
+        local_model,local_data_collator = get_model_and_collator(model_args,config,global_window)
+        
+        party2nets[party_id] = local_model
+        party2trainers[party_id] = get_trainer(local_model,training_args,train_ds_local,None,local_data_collator)
+        
+        
     # these loaders are used for evaluating accuracy of global model
-    global_train_dl, test_dl = get_dataloader(fed_args, fed_args.dataset, fed_args.datadir,
-                            train_bs=fed_args.batch_size, test_bs=fed_args.batch_size)
+    global_model,_ = get_model_and_collator(model_args,config,global_window)
+    
 
     # support random party sampling
     n_party_per_round = int(fed_args.n_parties * fed_args.sample_fraction)
@@ -453,15 +513,13 @@ if __name__ == '__main__':
     # ===================================================
 
 
-    # ================ network related ================
-    logger.info("Initializing nets")
-    party2nets = init_nets(fed_args.n_parties, config)
-    global_net = init_nets(1, fed_args)[0]
-    # =================================================
+
 
     # ================ run FL ================
-    fed_alg = Appr(fed_args, appr_args, logger, party_list_rounds,
-                party2nets, global_net,
-                party2loaders, global_train_dl, test_dl)
+    from approach.fedavg import FedAvg
+    fed_alg = FedAvg(fed_args, appr_args, logger, party_list_rounds,
+                party2nets, party2trainers, global_net,
+                party2loaders=None, global_train_dl, test_dl,last_checkpoint,training_args)
     fed_alg.run_fed()
     # ========================================
+

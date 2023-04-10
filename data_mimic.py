@@ -154,7 +154,166 @@ def load_full_codes(train_path, version='mimic3'):
     return ind2c, desc_dict
 
 
+#map style dataset
+class Mimic3Dataset(Dataset):
+    def __init__(self, version, mode, select_ids,truncate_length, tokenizer,
+                 label_truncate_length=30, term_count=1):
+        self.version = version
+        self.mode = mode
+        self.tokenizer = tokenizer
+        self.data_ids = select_ids
+        
+        if version in ['mimic3']:
+            self.train_path = os.path.join(MIMIC_3_DIR, "train_full.csv")
+        if version in ['mimic3-50']:
+            self.train_path = os.path.join(MIMIC_3_DIR, "train_50.csv")
+        if version in ['mimic3-50l']:
+            self.train_path = os.path.join(MIMIC_3_DIR, "train_50l.csv")
+            
+        self.df=[]
+        with open(self.path, "r") as f:
+            temp_df = ujson.load(f)
+            for row_id in self.data_ids:
+                self.df.append(temp_df[row_id])
+            
+        self.ind2c, desc_dict = load_full_codes(self.train_path, version=version)
+        # self.part_icd_codes = list(self.ind2c.values())
+        self.c2ind = {c: ind for ind, c in self.ind2c.items()}
+        self.code_count = len(self.ind2c)
+        if mode == "train":
+            print(f'Code count: {self.code_count}')
+        
+        self.ind2mc, self.mc2ind = create_main_code(self.ind2c)
+        self.main_code_count = len(self.ind2mc)
+        if mode == "train":
+            print(f'Main code count: {self.main_code_count}')
 
+        self.len = len(self.df)
+        self.truncate_length = truncate_length
+        
+        
+        # prep prompt
+        if version == "mimic3-50": #TODO: remove unique sorted ICD_50_RANK for mimic3-50
+            desc_list = []
+            icd_50_rank = ICD_50_RANK
+            assert len(icd_50_rank) == len(self.ind2c)
+            for icd9, info in icd_50_rank:
+                desc_list.append(desc_dict[icd9].lower().split(",")[0])
+        else:
+            desc_list = []
+            icd_50_rank = [(v,0) for k,v in self.ind2c.items()]
+            for icd9, info in icd_50_rank:
+                desc_list.append(desc_dict[icd9].lower().split(",")[0])
+        
+        if term_count == 1:
+            c_desc_list = desc_list
+        else:
+            c_desc_list = []
+            with open(f'./icd_mimic3_random_sort.json', 'r') as f: #TODO: change path
+                icd_syn = ujson.load(f)
+            for (code, info), tmp_desc in zip(icd_50_rank,desc_list):
+                tmp_desc = [tmp_desc]
+                new_terms = icd_syn.get(code, [])
+                if len(new_terms) >= term_count - 1:
+                    tmp_desc.extend(new_terms[0:term_count - 1])
+                else:
+                    tmp_desc.extend(new_terms)
+                    repeat_count = int (term_count / len(tmp_desc)) + 1
+                    tmp_desc = (tmp_desc * repeat_count)[0:term_count]
+                c_desc_list.append(tmp_desc)
+
+        descriptions = " " + " <mask>, ".join(desc_list) + " <mask>. "
+        tmp = self.tokenizer.tokenize(descriptions)
+        self.global_window = len(tmp) + 1
+        assert self.global_window < 501 # only for gpu memory efficiency
+
+        self.label_yes = self.tokenizer("yes")['input_ids'][1] # 10932
+        self.label_no  = self.tokenizer("no")['input_ids'][1]  # 2362
+        self.mask_token_id  = tokenizer.mask_token_id
+
+        # num_raw_token = []
+        # num_pro_token = []
+        # for index in range(self.len):
+        #     text = self.df[index]['TEXT']
+        #     text = re.sub(r'\[\*\*[^\]]*\*\*\]', '', text)  # remove any mimic special token like [**2120-2-28**] or [**Hospital1 3278**]
+        #     text = re.sub(r'  +', ' ', text)
+        #     label = str(self.df[index]['LABELS']).split(';') 
+        #     # self.process(text, label)
+        #     tmp = self.tokenizer.tokenize(text)
+        #     # num_raw_token.append(len(self.tokenizer.convert_tokens_to_string(tmp[:self.truncate_length]).split()))
+        #     num_pro_token.append(len(tmp))
+        # num_pro_token = np.array(num_pro_token)
+        # print(f'Num of examples exceed max length {self.truncate_length}: {(num_pro_token > self.truncate_length).sum()} / {len(num_pro_token)}')
+        # print(f'Avg text length: {num_pro_token.mean()}')
+        # print(f'Std text length: {np.std(num_pro_token)}')
+        # print(f'Med text length: {np.median(num_pro_token)}')
+        # print(f'Max text length: {num_pro_token.max()}')
+        # print(f'Min text length: {num_pro_token.min()}')
+
+        num_pro_token = []
+        to_sav = []
+        countb = 0
+        for index in range(self.len):
+            text = self.df[index]['TEXT']
+            text = re.sub(r'\[\*\*[^\]]*\*\*\]', '', text)  # remove any mimic special token like [**2120-2-28**] or [**Hospital1 3278**]
+            tmp = self.tokenizer.tokenize(descriptions + proc_text(text))
+            if len(tmp) <= self.truncate_length:
+                num_pro_token.append(len(tmp))
+                self.df[index]['TEXT'] = descriptions + proc_text(text)
+            else:
+                headers_pos = get_headersandindex(text)
+                if len(headers_pos) > 1:
+                    new_text = get_subnote(text, headers_pos)
+                    countb += 1
+                    text = new_text
+                    tmp = self.tokenizer.tokenize(descriptions + proc_text(text))
+                # else:
+                #     to_sav.append((str(self.df[index]['LABELS']),text))
+                num_pro_token.append(len(tmp))
+                self.df[index]['TEXT'] = descriptions + proc_text(text)
+        num_pro_token = np.array(num_pro_token)
+        print(f'Num of examples exceed max length {self.truncate_length}: {(num_pro_token > self.truncate_length).sum()} / {len(num_pro_token)}')
+        print(f'Avg text length: {num_pro_token.mean()}')
+        print(f'Std text length: {np.std(num_pro_token)}')
+        print(f'Med text length: {np.median(num_pro_token)}')
+        print(f'Max text length: {num_pro_token.max()}')
+        print(f'Min text length: {num_pro_token.min()}')
+
+        # with open('abc3.txt', 'w') as f:
+        #     for a,b in to_sav:
+        #         f.write(f"xxx\n{a}\n{b}\n")
+
+    def process(self, text, label):
+        input_word = self.tokenizer(text, padding='max_length', truncation='longest_first', max_length=self.truncate_length, 
+            return_token_type_ids=True, return_attention_mask=True
+            )
+        binary_label = [self.label_no] * self.code_count
+        for l in label:
+            if l in self.c2ind:
+                binary_label[self.c2ind[l]] = self.label_yes
+                
+        # main_label = [0] * self.main_code_count
+        # for l in label:
+        #     if l.split('.')[0] in self.mc2ind:
+        #         main_label[self.mc2ind[l.split('.')[0]]] = 1
+        
+        input_word["label_ids"] = torch.tensor(binary_label, dtype=torch.long)
+        return input_word
+
+    def __len__(self):
+        return self.len
+
+    def __getitem__(self, index):
+        # proc label 
+        label = str(self.df[index]['LABELS']).split(';')
+        # proc input
+        text = self.df[index]['TEXT']
+        processed = self.process(text, label)
+        return processed
+        
+        
+                                
+    
 class MimicFullDataset(Dataset):
     def __init__(self, version, mode, truncate_length, tokenizer,
                  label_truncate_length=30, term_count=1):

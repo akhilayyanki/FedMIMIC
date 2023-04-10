@@ -12,8 +12,8 @@ from loss import FedDecorrLoss
 class FedAvg:
 
     def __init__(self, args, appr_args, logger, party_list_rounds,
-                party2nets, global_net,
-                party2loaders, global_train_dl, test_dl):
+                party2nets, party2trainers, global_net,
+                party2loaders, global_train_dl, test_dl,training_args,checkpoint):
         self.args = args
         self.appr_args = appr_args
         self.logger = logger
@@ -23,7 +23,10 @@ class FedAvg:
         self.party2loaders = party2loaders
         self.global_train_dl = global_train_dl
         self.test_dl = test_dl
-
+        
+        self.party2trainers = party2trainers
+        self.training_args = training_args
+        self.last_checkpoint = last_checkpoint
 
     # function that processing the special arguments of current method
     @staticmethod
@@ -107,49 +110,74 @@ class FedAvg:
 
     def _local_training(self, party_id):
         net = self.party2nets[party_id]
-        net.train()
-        net.cuda()
+        trainer = self.party2trainers[party_id]
+        
+        training_args=self.training_args
+        if training_args.do_train:
+            checkpoint = None
+            if training_args.resume_from_checkpoint is not None:
+                checkpoint = training_args.resume_from_checkpoint
+            elif last_checkpoint is not None:
+                checkpoint = last_checkpoint
+            train_result = trainer.train(resume_from_checkpoint=checkpoint)
+            metrics = train_result.metrics
+            max_train_samples = (
+                data_args.max_train_samples if data_args.max_train_samples is not None else len(train_dataset)
+            )
+            metrics["train_samples"] = min(max_train_samples, len(train_dataset))
 
-        train_dataloader = self.party2loaders[party_id]
-        test_dataloader = self.test_dl
+            trainer.save_model()  # Saves the tokenizer too for easy upload
 
-        self.logger.info('Training network %s' % str(party_id))
-        self.logger.info('n_training: %d' % len(train_dataloader))
-        self.logger.info('n_test: %d' % len(test_dataloader))
+            trainer.log_metrics("train", metrics)
+            trainer.save_metrics("train", metrics)
+            trainer.save_state()
 
-        train_acc, _ = compute_accuracy(net, train_dataloader)
-        test_acc, _ = compute_accuracy(net, test_dataloader)
+        
+        
+        
+        # net.train()
+        # net.cuda()
 
-        self.logger.info('>> Pre-Training Training accuracy: {}'.format(train_acc))
-        self.logger.info('>> Pre-Training Test accuracy: {}'.format(test_acc))
+        # train_dataloader = self.party2loaders[party_id]
+        # test_dataloader = self.test_dl
 
-        optimizer = optim.SGD(filter(lambda p: p.requires_grad, net.parameters()),
-                              lr=self.args.lr, momentum=self.args.rho, weight_decay=self.args.weight_decay)
-        criterion = nn.CrossEntropyLoss()
-        feddecorr = FedDecorrLoss()
+        # self.logger.info('Training network %s' % str(party_id))
+        # self.logger.info('n_training: %d' % len(train_dataloader))
+        # self.logger.info('n_test: %d' % len(test_dataloader))
 
-        for epoch in range(self.args.epochs):
-            epoch_loss_collector = []
-            for batch_idx, (x, target) in enumerate(train_dataloader):
-                x, target = x.cuda(), target.cuda()
-                target = target.long()
-                optimizer.zero_grad()
-                out, features = net(x, return_features=True)
+        # train_acc, _ = compute_accuracy(net, train_dataloader)
+        # test_acc, _ = compute_accuracy(net, test_dataloader)
 
-                loss = criterion(out, target)
-                if self.appr_args.feddecorr:
-                    loss_feddecorr = feddecorr(features)
-                    loss = loss + self.appr_args.feddecorr_coef * loss_feddecorr
-                loss.backward()
-                optimizer.step()
+        # self.logger.info('>> Pre-Training Training accuracy: {}'.format(train_acc))
+        # self.logger.info('>> Pre-Training Test accuracy: {}'.format(test_acc))
 
-                epoch_loss_collector.append(loss.item())
+        # optimizer = optim.SGD(filter(lambda p: p.requires_grad, net.parameters()),
+        #                       lr=self.args.lr, momentum=self.args.rho, weight_decay=self.args.weight_decay)
+        # criterion = nn.CrossEntropyLoss()
+        # feddecorr = FedDecorrLoss()
 
-            epoch_loss = sum(epoch_loss_collector) / len(epoch_loss_collector)
-            self.logger.info('Epoch: %d Loss: %f' % (epoch, epoch_loss))
+        # for epoch in range(self.args.epochs):
+        #     epoch_loss_collector = []
+        #     for batch_idx, (x, target) in enumerate(train_dataloader):
+        #         x, target = x.cuda(), target.cuda()
+        #         target = target.long()
+        #         optimizer.zero_grad()
+        #         out, features = net(x, return_features=True)
 
-        train_acc, _ = compute_accuracy(net, train_dataloader)
-        test_acc, _ = compute_accuracy(net, test_dataloader)
-        self.logger.info('>> Training accuracy: %f' % train_acc)
-        self.logger.info('>> Test accuracy: %f' % test_acc)
-        net.to('cpu')
+        #         loss = criterion(out, target)
+        #         if self.appr_args.feddecorr:
+        #             loss_feddecorr = feddecorr(features)
+        #             loss = loss + self.appr_args.feddecorr_coef * loss_feddecorr
+        #         loss.backward()
+        #         optimizer.step()
+
+        #         epoch_loss_collector.append(loss.item())
+
+        #     epoch_loss = sum(epoch_loss_collector) / len(epoch_loss_collector)
+        #     self.logger.info('Epoch: %d Loss: %f' % (epoch, epoch_loss))
+
+        # train_acc, _ = compute_accuracy(net, train_dataloader)
+        # test_acc, _ = compute_accuracy(net, test_dataloader)
+        # self.logger.info('>> Training accuracy: %f' % train_acc)
+        # self.logger.info('>> Test accuracy: %f' % test_acc)
+        # net.to('cpu')
